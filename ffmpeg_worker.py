@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import locale
 import re
+import shlex
 import shutil
 import subprocess
 import tempfile
@@ -50,6 +51,11 @@ class MediaInfo:
     name: str
     format_name: str
     duration: float | None
+    video_codec: str | None = None
+    audio_codec: str | None = None
+    bitrate: int | None = None
+    fps: float | None = None
+    resolution: str | None = None
 
 
 @dataclass
@@ -58,6 +64,7 @@ class CommandJob:
     output_path: Path | None
     progress_duration: float | None
     cleanup_paths: list[Path] = field(default_factory=list)
+    title: str = ""
 
 
 @dataclass
@@ -115,9 +122,42 @@ def probe_media_info(input_path: str | Path) -> MediaInfo:
         return MediaInfo(path.name, path.suffix.lstrip(".").upper() or "невідомо", None)
 
     media_format = payload.get("format", {})
+    streams = payload.get("streams", [])
+    video_stream = next((stream for stream in streams if stream.get("codec_type") == "video"), {})
+    audio_stream = next((stream for stream in streams if stream.get("codec_type") == "audio"), {})
     duration = _safe_float(media_format.get("duration"))
     format_name = media_format.get("format_name") or path.suffix.lstrip(".").upper() or "невідомо"
-    return MediaInfo(path.name, str(format_name), duration)
+    fps = _parse_fps(video_stream.get("avg_frame_rate") or video_stream.get("r_frame_rate"))
+    width = video_stream.get("width")
+    height = video_stream.get("height")
+    resolution = f"{width}x{height}" if width and height else None
+    bitrate = _safe_int(media_format.get("bit_rate"))
+    return MediaInfo(
+        path.name,
+        str(format_name),
+        duration,
+        video_codec=video_stream.get("codec_name"),
+        audio_codec=audio_stream.get("codec_name"),
+        bitrate=bitrate,
+        fps=fps,
+        resolution=resolution,
+    )
+
+
+def probe_media_details(input_path: str | Path) -> str:
+    path = Path(input_path)
+    info = probe_media_info(path)
+    lines = [
+        f"Файл: {info.name}",
+        f"Формат: {info.format_name}",
+        f"Тривалість: {format_duration(info.duration)}",
+        f"Відеокодек: {info.video_codec or '-'}",
+        f"Аудіокодек: {info.audio_codec or '-'}",
+        f"Бітрейт: {_format_bitrate(info.bitrate)}",
+        f"FPS: {_format_number(info.fps)}",
+        f"Роздільна здатність: {info.resolution or '-'}",
+    ]
+    return "\n".join(lines)
 
 
 def build_command_job(
@@ -147,22 +187,33 @@ def run_ffmpeg(
     *,
     progress_callback: Callable[[float], None] | None = None,
     status_callback: Callable[[str], None] | None = None,
+    output_callback: Callable[[str], None] | None = None,
 ) -> FfmpegResult:
-    if not shutil.which("ffmpeg"):
+    executable = Path(job.command[0]).name.lower()
+    is_ffmpeg = executable in {"ffmpeg", "ffmpeg.exe"}
+    if is_ffmpeg and not shutil.which("ffmpeg"):
         text = "FFmpeg не знайдено в PATH. Встановіть FFmpeg або додайте його до змінної PATH."
         log_path = _write_error_log(job.command, text)
         _cleanup(job.cleanup_paths)
         return FfmpegResult(False, -1, job.command, job.output_path, log_path, text)
+    if not is_ffmpeg and not shutil.which(job.command[0]):
+        text = f"Команду не знайдено в PATH: {job.command[0]}"
+        log_path = _write_error_log(job.command, text, prefix="process_error")
+        _cleanup(job.cleanup_paths)
+        return FfmpegResult(False, -1, job.command, job.output_path, log_path, text)
 
-    runtime_command = [
-        job.command[0],
-        "-hide_banner",
-        "-nostdin",
-        "-progress",
-        "pipe:1",
-        "-nostats",
-        *job.command[1:],
-    ]
+    if is_ffmpeg:
+        runtime_command = [
+            job.command[0],
+            "-hide_banner",
+            "-nostdin",
+            "-progress",
+            "pipe:1",
+            "-nostats",
+            *job.command[1:],
+        ]
+    else:
+        runtime_command = job.command[:]
 
     output_lines: list[str] = []
     returncode = -1
@@ -189,6 +240,8 @@ def run_ffmpeg(
         if not line:
             continue
         output_lines.append(line)
+        if output_callback:
+            output_callback(raw_line)
         _handle_progress_line(line, job.progress_duration, progress_callback, status_callback)
 
     returncode = process.wait()
@@ -300,20 +353,69 @@ def _build_video_job(
     if sub_tab == "Конвертація та стиснення":
         output_format = str(settings["format"])
         codec_label = str(settings["codec"])
-        if output_format == "WebM" and codec_label != "AV1":
-            raise CommandBuildError("Для WebM оберіть кодек AV1 або змініть контейнер на MP4/MKV/MOV.")
         output_path = _unique_output_path(source, FORMAT_EXTENSIONS[output_format])
-        codec = _video_codec_arg(codec_label)
-        command = ["ffmpeg", "-i", str(source), "-c:v", codec, "-crf", str(int(settings["crf"]))]
+        codec = _video_codec_arg(codec_label, settings)
+        command = ["ffmpeg", "-i", str(source)]
 
+        filters: list[str] = []
         resolution = str(settings["resolution"])
         if resolution != "Оригінал":
             width, height = resolution.split(" ")[0].split("x")
-            command.extend(["-vf", f"scale={width}:{height}"])
+            filters.append(f"scale={width}:{height}")
+        filters.extend(_video_common_filters(settings))
+        if filters:
+            command.extend(["-vf", ",".join(filters)])
 
+        audio_filters = _video_audio_filters(settings)
+        if audio_filters:
+            command.extend(["-af", ",".join(audio_filters)])
+
+        command.extend(["-c:v", codec])
+        if _uses_crf(codec):
+            command.extend(["-crf", str(int(settings["crf"]))])
         command.extend(_audio_codec_for_video_container(output_format))
+        command.extend(_custom_args(settings))
         command.append(str(output_path))
         return CommandJob(command, output_path, duration)
+
+    if sub_tab == "Пакетна обробка":
+        batch_files = [Path(path) for path in settings.get("batch_files", [])]
+        if not batch_files:
+            raise CommandBuildError("Додайте файли для пакетної обробки.")
+        first = batch_files[0]
+        output_format = str(settings.get("format", "MP4"))
+        output_path = _unique_output_path(first, FORMAT_EXTENSIONS[output_format])
+        codec = _video_codec_arg(str(settings.get("codec", "H.264")), settings)
+        command = ["ffmpeg", "-i", str(first), "-c:v", codec, "-crf", str(int(settings.get("crf", 23)))]
+        command.extend(_audio_codec_for_video_container(output_format))
+        command.extend(_custom_args(settings))
+        command.append(str(output_path))
+        return CommandJob(command, output_path, duration, title=f"Пакет: {first.name}")
+
+    if sub_tab == "Відео ефекти":
+        output_path = _unique_output_path(source, source.suffix or ".mp4", "_effects")
+        filters = _video_common_filters(settings)
+        audio_filters = _video_audio_filters(settings)
+        if not filters and not audio_filters:
+            raise CommandBuildError("Оберіть хоча б один відео або аудіо ефект.")
+        command = ["ffmpeg", "-i", str(source)]
+        if filters:
+            command.extend(["-vf", ",".join(filters)])
+        if audio_filters:
+            command.extend(["-af", ",".join(audio_filters)])
+        command.extend(["-c:v", _video_codec_arg(str(settings.get("codec", "H.264")), settings), "-c:a", "aac"])
+        command.extend(_custom_args(settings))
+        command.append(str(output_path))
+        return CommandJob(command, output_path, duration)
+
+    if sub_tab == "Водяний знак і субтитри":
+        return _build_watermark_subtitle_job(source, settings, duration)
+
+    if sub_tab == "Кадри GIF мініатюра":
+        return _build_video_extract_job(source, settings, duration)
+
+    if sub_tab == "YouTube таймлапс стискання":
+        return _build_video_extra_job(source, settings, duration)
 
     if sub_tab == "Обрізання та Склеювання":
         concat_files = [Path(path) for path in settings.get("concat_files", [])]
@@ -393,6 +495,153 @@ def _build_video_job(
     raise CommandBuildError("Не вдалося визначити активну підвкладку відео.")
 
 
+def _build_watermark_subtitle_job(source: Path, settings: dict[str, object], duration: float | None) -> CommandJob:
+    output_path = _unique_output_path(source, source.suffix or ".mp4", "_marked")
+    watermark_mode = str(settings.get("watermark_mode", "Текст"))
+    watermark_text = str(settings.get("watermark_text") or "").strip()
+    watermark_image = str(settings.get("watermark_image") or "").strip()
+    subtitles = str(settings.get("subtitles") or "").strip()
+
+    command = ["ffmpeg", "-i", str(source)]
+    filters: list[str] = []
+
+    if watermark_mode == "Текст" and watermark_text:
+        safe_text = watermark_text.replace("\\", "\\\\").replace(":", "\\:").replace("'", "\\'")
+        filters.append(
+            "drawtext="
+            f"text='{safe_text}':x=20:y=20:fontsize=28:fontcolor=white:"
+            "box=1:boxcolor=black@0.45:boxborderw=8"
+        )
+    elif watermark_mode == "Зображення":
+        if not watermark_image:
+            raise CommandBuildError("Оберіть зображення водяного знака.")
+        image_path = Path(watermark_image)
+        if not image_path.exists():
+            raise CommandBuildError("Файл водяного знака не знайдено.")
+        command.extend(["-i", str(image_path)])
+        filter_complex = "[0:v][1:v]overlay=20:20"
+        if subtitles:
+            subtitle_path = _ffmpeg_filter_path(Path(subtitles))
+            filter_complex += f",subtitles='{subtitle_path}'"
+        command.extend(["-filter_complex", filter_complex, "-c:a", "copy"])
+        command.extend(_custom_args(settings))
+        command.append(str(output_path))
+        return CommandJob(command, output_path, duration)
+
+    if subtitles:
+        subtitle_path = Path(subtitles)
+        if not subtitle_path.exists():
+            raise CommandBuildError("Файл субтитрів не знайдено.")
+        filters.append(f"subtitles='{_ffmpeg_filter_path(subtitle_path)}'")
+
+    if not filters:
+        raise CommandBuildError("Додайте текст/зображення водяного знака або файл субтитрів.")
+
+    command.extend(["-vf", ",".join(filters), "-c:a", "copy"])
+    command.extend(_custom_args(settings))
+    command.append(str(output_path))
+    return CommandJob(command, output_path, duration)
+
+
+def _build_video_extract_job(source: Path, settings: dict[str, object], duration: float | None) -> CommandJob:
+    operation = str(settings.get("operation", "Витягнути кадри"))
+    if operation == "Витягнути кадри":
+        fps = str(settings.get("frames_fps") or "1").strip()
+        image_format = str(settings.get("image_format") or "PNG")
+        if not re.fullmatch(r"\d+(\.\d+)?", fps) or float(fps) <= 0:
+            raise CommandBuildError("FPS для витягування кадрів має бути додатним числом.")
+        parent = _output_directory(settings, source.parent)
+        frames_dir = _unique_directory(parent / f"{source.stem}_frames")
+        frames_dir.mkdir(parents=True, exist_ok=False)
+        extension = ".jpg" if image_format == "JPG" else ".png"
+        pattern = frames_dir / f"frame_%05d{extension}"
+        command = ["ffmpeg", "-i", str(source), "-vf", f"fps={fps}", str(pattern)]
+        return CommandJob(command, frames_dir, duration)
+
+    if operation == "Створити GIF":
+        start = parse_time_to_seconds(settings.get("gif_start"))
+        end = parse_time_to_seconds(settings.get("gif_end"))
+        if start is not None and end is not None and end <= start:
+            raise CommandBuildError("Кінцевий час GIF має бути більшим за початковий.")
+        output_path = _unique_output_path(source, ".gif", "_gif")
+        fps = int(settings.get("gif_fps", 15))
+        width = int(settings.get("gif_width", 480))
+        filter_graph = (
+            f"[0:v]fps={fps},scale={width}:-1:flags=lanczos,split[s0][s1];"
+            "[s0]palettegen[p];[s1][p]paletteuse"
+        )
+        command = ["ffmpeg"]
+        if start is not None:
+            command.extend(["-ss", _format_seconds(start)])
+        if start is not None and end is not None:
+            command.extend(["-t", _format_seconds(end - start)])
+        elif end is not None:
+            command.extend(["-to", _format_seconds(end)])
+        command.extend(["-i", str(source), "-filter_complex", filter_graph, "-loop", "0", str(output_path)])
+        return CommandJob(command, output_path, _effective_duration(start, end, duration))
+
+    thumb_time = parse_time_to_seconds(settings.get("thumbnail_time")) or 1
+    image_format = str(settings.get("image_format") or "PNG")
+    extension = ".jpg" if image_format == "JPG" else ".png"
+    output_path = _unique_output_path(source, extension, "_thumbnail")
+    command = ["ffmpeg", "-ss", _format_seconds(thumb_time), "-i", str(source), "-frames:v", "1", str(output_path)]
+    return CommandJob(command, output_path, None)
+
+
+def _build_video_extra_job(source: Path, settings: dict[str, object], duration: float | None) -> CommandJob:
+    operation = str(settings.get("operation", "Таймлапс"))
+    if operation == "Завантажити YouTube":
+        url = str(settings.get("youtube_url") or "").strip()
+        if not url:
+            raise CommandBuildError("Вставте URL YouTube.")
+        output_dir = _output_directory(settings, source.parent)
+        output_template = output_dir / "%(title)s.%(ext)s"
+        return CommandJob(["yt-dlp", "-o", str(output_template), url], output_dir, None, title="YouTube")
+
+    if operation == "Автостискання":
+        target_mb = _safe_float(settings.get("target_mb")) or 25
+        if duration is None or duration <= 0:
+            raise CommandBuildError("Для автостискання потрібна відома тривалість відео.")
+        output_path = _unique_output_path(source, ".mp4", "_target_size")
+        total_kbits = target_mb * 8192
+        audio_kbps = 128
+        video_kbps = max(150, int(total_kbits / duration - audio_kbps))
+        command = [
+            "ffmpeg",
+            "-i",
+            str(source),
+            "-c:v",
+            _video_codec_arg(str(settings.get("codec", "H.264")), settings),
+            "-b:v",
+            f"{video_kbps}k",
+            "-maxrate",
+            f"{int(video_kbps * 1.25)}k",
+            "-bufsize",
+            f"{int(video_kbps * 2)}k",
+            "-c:a",
+            "aac",
+            "-b:a",
+            f"{audio_kbps}k",
+            str(output_path),
+        ]
+        return CommandJob(command, output_path, duration)
+
+    speed = _safe_float(settings.get("timelapse_speed")) or 8
+    if speed <= 0:
+        raise CommandBuildError("Швидкість таймлапсу має бути більшою за 0.")
+    output_path = _unique_output_path(source, source.suffix or ".mp4", "_timelapse")
+    command = [
+        "ffmpeg",
+        "-i",
+        str(source),
+        "-vf",
+        f"setpts=PTS/{speed:.3f}",
+        "-an",
+        str(output_path),
+    ]
+    return CommandJob(command, output_path, duration / speed if duration else None)
+
+
 def _build_audio_job(
     source: Path,
     sub_tab: str,
@@ -434,6 +683,30 @@ def _build_audio_job(
         command.extend(_audio_encoder_args_for_extension(output_extension))
         command.append(str(output_path))
         return CommandJob(command, output_path, output_duration)
+
+    if sub_tab == "Об'єднання та витягування":
+        operation = str(settings.get("operation", "Об'єднати аудіо"))
+        if operation == "Витягнути аудіо з відео":
+            output_format = str(settings.get("format", "MP3"))
+            output_path = _unique_output_path(source, FORMAT_EXTENSIONS[output_format], "_extracted_audio")
+            command = ["ffmpeg", "-i", str(source), "-vn"]
+            command.extend(_audio_encoder_args(output_format, str(settings.get("bitrate", "192 kbps"))))
+            command.append(str(output_path))
+            return CommandJob(command, output_path, duration)
+
+        audio_files = [Path(path) for path in settings.get("audio_files", [])]
+        if not audio_files:
+            raise CommandBuildError("Додайте аудіофайли для об'єднання.")
+        for audio_file in audio_files:
+            if not audio_file.exists():
+                raise CommandBuildError(f"Аудіофайл не знайдено: {audio_file}")
+        output_format = str(settings.get("format", "MP3"))
+        output_path = _unique_output_path(audio_files[0], FORMAT_EXTENSIONS[output_format], "_merged_audio")
+        list_file = _create_concat_list(audio_files)
+        command = ["ffmpeg", "-f", "concat", "-safe", "0", "-i", str(list_file)]
+        command.extend(_audio_encoder_args(output_format, str(settings.get("bitrate", "192 kbps"))))
+        command.append(str(output_path))
+        return CommandJob(command, output_path, None, [list_file])
 
     raise CommandBuildError("Не вдалося визначити активну підвкладку аудіо.")
 
@@ -496,10 +769,113 @@ def _build_photo_job(
     raise CommandBuildError("Не вдалося визначити активну підвкладку фото.")
 
 
-def _video_codec_arg(label: str) -> str:
-    if label == "AV1":
-        return "libaom-av1"
-    return label
+def _video_codec_arg(label: str, settings: dict[str, object] | None = None) -> str:
+    settings = settings or {}
+    hw = str(settings.get("hwaccel") or "Без прискорення")
+    normalized = label.strip()
+
+    if hw == "NVIDIA NVENC":
+        return {
+            "H.264": "h264_nvenc",
+            "libx264": "h264_nvenc",
+            "H.265": "hevc_nvenc",
+            "libx265": "hevc_nvenc",
+            "AV1": "av1_nvenc",
+        }.get(normalized, "h264_nvenc")
+    if hw == "Intel Quick Sync":
+        return {
+            "H.264": "h264_qsv",
+            "libx264": "h264_qsv",
+            "H.265": "hevc_qsv",
+            "libx265": "hevc_qsv",
+            "AV1": "av1_qsv",
+            "VP9": "vp9_qsv",
+        }.get(normalized, "h264_qsv")
+    if hw == "AMD AMF":
+        return {
+            "H.264": "h264_amf",
+            "libx264": "h264_amf",
+            "H.265": "hevc_amf",
+            "libx265": "hevc_amf",
+            "AV1": "av1_amf",
+        }.get(normalized, "h264_amf")
+
+    return {
+        "H.264": "libx264",
+        "libx264": "libx264",
+        "H.265": "libx265",
+        "libx265": "libx265",
+        "AV1": "libaom-av1",
+        "VP9": "libvpx-vp9",
+    }.get(normalized, normalized)
+
+
+def _uses_crf(codec: str) -> bool:
+    return codec not in {"h264_nvenc", "hevc_nvenc", "av1_nvenc", "h264_amf", "hevc_amf", "av1_amf"}
+
+
+def _video_common_filters(settings: dict[str, object]) -> list[str]:
+    filters: list[str] = []
+    rotate = str(settings.get("rotate") or "Без повороту")
+    if rotate == "90° вправо":
+        filters.append("transpose=1")
+    elif rotate == "90° вліво":
+        filters.append("transpose=2")
+    elif rotate == "180°":
+        filters.append("transpose=1,transpose=1")
+
+    fps = str(settings.get("fps") or "Оригінал")
+    if fps != "Оригінал":
+        filters.append(f"fps={fps}")
+
+    speed = _safe_float(settings.get("speed")) or 1.0
+    if abs(speed - 1.0) > 0.001:
+        filters.append(f"setpts=PTS/{speed:.3f}")
+    return filters
+
+
+def _video_audio_filters(settings: dict[str, object]) -> list[str]:
+    filters: list[str] = []
+    if bool(settings.get("normalize_audio")):
+        filters.append("loudnorm")
+    speed = _safe_float(settings.get("speed")) or 1.0
+    if abs(speed - 1.0) > 0.001:
+        filters.extend(_atempo_filters(speed))
+    return filters
+
+
+def _atempo_filters(speed: float) -> list[str]:
+    values: list[float] = []
+    remaining = speed
+    while remaining > 2.0:
+        values.append(2.0)
+        remaining /= 2.0
+    while remaining < 0.5:
+        values.append(0.5)
+        remaining /= 0.5
+    values.append(remaining)
+    return [f"atempo={value:.3f}" for value in values if value > 0]
+
+
+def _custom_args(settings: dict[str, object]) -> list[str]:
+    custom = str(settings.get("custom_args") or "").strip()
+    if not custom:
+        return []
+    try:
+        return shlex.split(custom, posix=False)
+    except ValueError as exc:
+        raise CommandBuildError(f"Власні параметри FFmpeg некоректні: {exc}") from exc
+
+
+def _output_directory(settings: dict[str, object], fallback: Path) -> Path:
+    text = str(settings.get("output_dir") or "").strip()
+    path = Path(text) if text else fallback
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+def _ffmpeg_filter_path(path: Path) -> str:
+    return path.resolve().as_posix().replace("\\", "\\\\").replace(":", "\\:").replace("'", "\\'")
 
 
 def _audio_codec_for_video_container(output_format: str) -> list[str]:
@@ -675,3 +1051,40 @@ def _safe_float(value: object) -> float | None:
         return float(value)
     except (TypeError, ValueError):
         return None
+
+
+def _safe_int(value: object) -> int | None:
+    try:
+        if value is None:
+            return None
+        return int(float(value))
+    except (TypeError, ValueError):
+        return None
+
+
+def _parse_fps(value: object) -> float | None:
+    text = str(value or "")
+    if "/" in text:
+        numerator, denominator = text.split("/", 1)
+        try:
+            denominator_value = float(denominator)
+            if denominator_value == 0:
+                return None
+            return float(numerator) / denominator_value
+        except ValueError:
+            return None
+    return _safe_float(text)
+
+
+def _format_bitrate(value: int | None) -> str:
+    if not value:
+        return "-"
+    if value >= 1_000_000:
+        return f"{value / 1_000_000:.2f} Mbps"
+    return f"{value / 1000:.0f} kbps"
+
+
+def _format_number(value: float | None) -> str:
+    if value is None:
+        return "-"
+    return f"{value:.2f}".rstrip("0").rstrip(".")

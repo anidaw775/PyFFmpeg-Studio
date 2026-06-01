@@ -1,7 +1,10 @@
 from __future__ import annotations
 
 import json
+import shutil
+import subprocess
 import threading
+import time
 import tkinter as tk
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
@@ -23,6 +26,7 @@ from ffmpeg_worker import (
     FfmpegResult,
     build_command_job,
     format_duration,
+    probe_media_details,
     probe_media_info,
     run_cmd_command,
     run_ffmpeg,
@@ -30,6 +34,8 @@ from ffmpeg_worker import (
 
 APP_DIR = Path(__file__).resolve().parent
 CONFIG_PATH = APP_DIR / "settings.json"
+HISTORY_PATH = APP_DIR / "history.json"
+PROFILES_PATH = APP_DIR / "profiles.json"
 ICON_PATH = APP_DIR / "icon_PyFFmpeg_Studio.png"
 
 LANGUAGE_NAMES = {
@@ -150,6 +156,11 @@ class PyFFmpegStudioApp(BaseTk):
         if self.language_code not in LANGUAGE_NAMES:
             self.language_code = "uk"
         self.language_name = tk.StringVar(value=LANGUAGE_NAMES[self.language_code])
+        self.theme_name = tk.StringVar(value=str(self.settings.get("theme", "Світла")))
+        self.advanced_enabled = tk.BooleanVar(value=bool(self.settings.get("advanced_enabled", False)))
+        self.advanced_codec = tk.StringVar(value=str(self.settings.get("advanced_codec", "Авто")))
+        self.advanced_hwaccel = tk.StringVar(value=str(self.settings.get("advanced_hwaccel", "Без прискорення")))
+        self.advanced_custom_args = tk.StringVar(value=str(self.settings.get("advanced_custom_args", "")))
         self._app_icon: tk.PhotoImage | None = None
         self._apply_window_icon()
 
@@ -162,7 +173,14 @@ class PyFFmpegStudioApp(BaseTk):
         self.progress_value = tk.DoubleVar(value=0)
         self.media_duration: float | None = None
         self.processing = False
+        self.processing_started_at = 0.0
+        self.last_ffmpeg_log = ""
+        self.task_queue: list[CommandJob] = []
+        self.history = self._load_json_list(HISTORY_PATH)
+        self.profiles = self._load_json_dict(PROFILES_PATH)
         self.concat_files: list[Path] = []
+        self.batch_files: list[Path] = []
+        self.audio_merge_files: list[Path] = []
         self.manual_workdir = tk.StringVar(value=str(Path.cwd()))
         self._previous_widget_states: dict[tk.Widget, str] = {}
 
@@ -179,6 +197,30 @@ class PyFFmpegStudioApp(BaseTk):
 
     def _save_settings(self) -> None:
         CONFIG_PATH.write_text(json.dumps(self.settings, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    def _load_json_list(self, path: Path) -> list[dict[str, object]]:
+        if not path.exists():
+            return []
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return []
+        return payload if isinstance(payload, list) else []
+
+    def _load_json_dict(self, path: Path) -> dict[str, object]:
+        if not path.exists():
+            return {}
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return {}
+        return payload if isinstance(payload, dict) else {}
+
+    def _save_history(self) -> None:
+        HISTORY_PATH.write_text(json.dumps(self.history[-200:], ensure_ascii=False, indent=2), encoding="utf-8")
+
+    def _save_profiles(self) -> None:
+        PROFILES_PATH.write_text(json.dumps(self.profiles, ensure_ascii=False, indent=2), encoding="utf-8")
 
     def _tr(self, text: str, **kwargs) -> str:
         translated = TRANSLATIONS.get(self.language_code, {}).get(text, text)
@@ -206,21 +248,31 @@ class PyFFmpegStudioApp(BaseTk):
             style.theme_use("clam")
         except tk.TclError:
             pass
-        style.configure("TFrame", background="#f3f6fb")
-        style.configure("Panel.TFrame", background="#ffffff", relief="solid", borderwidth=1)
-        style.configure("InfoCard.TFrame", background="#f8fafc", relief="solid", borderwidth=1)
-        style.configure("TLabel", background="#f3f6fb", foreground="#1f2933", font=("Segoe UI", 10))
-        style.configure("Panel.TLabel", background="#ffffff", foreground="#1f2933", font=("Segoe UI", 10))
-        style.configure("InfoCard.TLabel", background="#f8fafc", foreground="#334155", font=("Segoe UI", 10))
-        style.configure("Header.TLabel", background="#ffffff", foreground="#0f172a", font=("Segoe UI", 18, "bold"))
-        style.configure("Muted.TLabel", background="#ffffff", foreground="#64748b", font=("Segoe UI", 9))
-        style.configure("Title.TLabel", background="#ffffff", foreground="#111827", font=("Segoe UI", 11, "bold"))
+        dark = self.theme_name.get() == "Темна"
+        colors = {
+            "app": "#0f172a" if dark else "#f3f6fb",
+            "panel": "#111827" if dark else "#ffffff",
+            "card": "#1f2937" if dark else "#f8fafc",
+            "text": "#e5e7eb" if dark else "#1f2933",
+            "muted": "#9ca3af" if dark else "#64748b",
+            "title": "#f9fafb" if dark else "#111827",
+        }
+        self.configure(background=colors["app"])
+        style.configure("TFrame", background=colors["app"])
+        style.configure("Panel.TFrame", background=colors["panel"], relief="solid", borderwidth=1)
+        style.configure("InfoCard.TFrame", background=colors["card"], relief="solid", borderwidth=1)
+        style.configure("TLabel", background=colors["app"], foreground=colors["text"], font=("Segoe UI", 10))
+        style.configure("Panel.TLabel", background=colors["panel"], foreground=colors["text"], font=("Segoe UI", 10))
+        style.configure("InfoCard.TLabel", background=colors["card"], foreground=colors["text"], font=("Segoe UI", 10))
+        style.configure("Header.TLabel", background=colors["panel"], foreground=colors["title"], font=("Segoe UI", 18, "bold"))
+        style.configure("Muted.TLabel", background=colors["panel"], foreground=colors["muted"], font=("Segoe UI", 9))
+        style.configure("Title.TLabel", background=colors["panel"], foreground=colors["title"], font=("Segoe UI", 11, "bold"))
         style.configure("TButton", font=("Segoe UI", 10), padding=(10, 6))
         style.configure("Accent.TButton", background="#2563eb", foreground="#ffffff", font=("Segoe UI", 10, "bold"), padding=(12, 7))
         style.map("Accent.TButton", background=[("active", "#1d4ed8"), ("disabled", "#93c5fd")])
         style.configure("Run.TButton", background="#16a34a", foreground="#ffffff", font=("Segoe UI", 11, "bold"), padding=(14, 8))
         style.map("Run.TButton", background=[("active", "#15803d"), ("disabled", "#86efac")])
-        style.configure("TNotebook", background="#f3f6fb", borderwidth=0)
+        style.configure("TNotebook", background=colors["app"], borderwidth=0)
         style.configure("TNotebook.Tab", padding=(14, 8), font=("Segoe UI", 10))
         style.configure("Horizontal.TProgressbar", thickness=16)
 
@@ -246,7 +298,12 @@ class PyFFmpegStudioApp(BaseTk):
             text=self._tr("Конвертація, обрізання, GIF, розкадровка та ручні CMD-команди в одному вікні"),
             style="Muted.TLabel",
         ).grid(row=1, column=0, sticky="w", pady=(2, 0))
-        ttk.Button(header, text=self._tr("Налаштування"), command=self.open_settings_dialog).grid(row=0, column=1, rowspan=2, sticky="e")
+        header_actions = ttk.Frame(header, style="Panel.TFrame")
+        header_actions.grid(row=0, column=1, rowspan=2, sticky="e")
+        self.advanced_button = ttk.Button(header_actions, text="Просунутий режим", command=self.open_advanced_dialog)
+        if self.advanced_enabled.get():
+            self.advanced_button.pack(side="left", padx=(0, 8))
+        ttk.Button(header_actions, text=self._tr("Налаштування"), command=self.open_settings_dialog).pack(side="left")
 
         self.drop_zone = tk.Label(
             panel,
@@ -271,7 +328,11 @@ class PyFFmpegStudioApp(BaseTk):
         ttk.Label(panel, text=self._tr("Вхідний файл"), style="Title.TLabel").grid(row=2, column=0, sticky="w", padx=(0, 10))
         self.input_entry = ttk.Entry(panel, textvariable=self.input_path, state="readonly")
         self.input_entry.grid(row=2, column=1, sticky="ew", padx=(0, 10))
-        ttk.Button(panel, text=self._tr("Обрати файл"), style="Accent.TButton", command=self.choose_input_file).grid(row=2, column=2, sticky="e")
+        file_actions = ttk.Frame(panel, style="Panel.TFrame")
+        file_actions.grid(row=2, column=2, sticky="e")
+        ttk.Button(file_actions, text="Перегляд", command=self.preview_input_file).pack(side="left", padx=(0, 6))
+        ttk.Button(file_actions, text="Інфо", command=self.show_file_info).pack(side="left", padx=(0, 6))
+        ttk.Button(file_actions, text=self._tr("Обрати файл"), style="Accent.TButton", command=self.choose_input_file).pack(side="left")
 
         info_frame = ttk.Frame(panel, style="Panel.TFrame")
         info_frame.grid(row=3, column=0, columnspan=3, sticky="ew", pady=(12, 0))
@@ -312,33 +373,85 @@ class PyFFmpegStudioApp(BaseTk):
         )
         language_combo.grid(row=0, column=1, sticky="ew", pady=(0, 12))
 
+        theme_var = tk.StringVar(value=self.theme_name.get())
+        ttk.Label(body, text="Тема", style="Panel.TLabel").grid(row=1, column=0, sticky="w", padx=(0, 12), pady=(0, 12))
+        ttk.Combobox(body, textvariable=theme_var, values=["Світла", "Темна"], state="readonly", width=24).grid(
+            row=1, column=1, sticky="ew", pady=(0, 12)
+        )
+
+        advanced_var = tk.BooleanVar(value=self.advanced_enabled.get())
+        ttk.Checkbutton(body, text="Увімкнути просунутий режим", variable=advanced_var).grid(
+            row=2, column=0, columnspan=2, sticky="w", pady=(0, 12)
+        )
+
         button_row = ttk.Frame(body, style="Panel.TFrame")
-        button_row.grid(row=1, column=0, columnspan=2, sticky="e")
+        button_row.grid(row=3, column=0, columnspan=2, sticky="e")
         ttk.Button(button_row, text=self._tr("Закрити"), command=dialog.destroy).pack(side="right", padx=(8, 0))
         ttk.Button(
             button_row,
             text=self._tr("Зберегти"),
             style="Accent.TButton",
-            command=lambda: self._save_settings_dialog(dialog, language_var.get()),
+            command=lambda: self._save_settings_dialog(dialog, language_var.get(), theme_var.get(), advanced_var.get()),
         ).pack(side="right")
 
         language_combo.focus_set()
         dialog.grab_set()
 
-    def _save_settings_dialog(self, dialog: tk.Toplevel, language_name: str) -> None:
+    def _save_settings_dialog(self, dialog: tk.Toplevel, language_name: str, theme_name: str, advanced_enabled: bool) -> None:
         language_code = next((code for code, name in LANGUAGE_NAMES.items() if name == language_name), "uk")
-        if language_code != self.language_code:
+        needs_rebuild = language_code != self.language_code or theme_name != self.theme_name.get() or advanced_enabled != self.advanced_enabled.get()
+        if needs_rebuild:
             state = self._snapshot_ui_state()
             self.language_code = language_code
             self.language_name.set(LANGUAGE_NAMES[language_code])
+            self.theme_name.set(theme_name)
+            self.advanced_enabled.set(advanced_enabled)
             self.settings["language"] = language_code
+            self.settings["theme"] = theme_name
+            self.settings["advanced_enabled"] = advanced_enabled
             self._save_settings()
             dialog.destroy()
+            self._configure_style()
             self._rebuild_layout(state)
             messagebox.showinfo(self._tr("Зміна мови"), self._tr("Мову змінено. Інтерфейс оновлено."))
             return
 
         self.settings["language"] = language_code
+        self.settings["theme"] = theme_name
+        self.settings["advanced_enabled"] = advanced_enabled
+        self._save_settings()
+        dialog.destroy()
+
+    def open_advanced_dialog(self) -> None:
+        dialog = tk.Toplevel(self)
+        dialog.title("Просунутий режим")
+        dialog.transient(self)
+        dialog.configure(background="#ffffff")
+        body = ttk.Frame(dialog, style="Panel.TFrame", padding=16)
+        body.grid(row=0, column=0, sticky="nsew")
+        body.columnconfigure(1, weight=1)
+        ttk.Label(body, text="Кодек").grid(row=0, column=0, sticky="w", padx=(0, 10), pady=6)
+        ttk.Combobox(body, textvariable=self.advanced_codec, values=["Авто", "H.264", "H.265", "AV1", "VP9"], state="readonly").grid(
+            row=0, column=1, sticky="ew", pady=6
+        )
+        ttk.Label(body, text="Апаратне прискорення").grid(row=1, column=0, sticky="w", padx=(0, 10), pady=6)
+        ttk.Combobox(
+            body,
+            textvariable=self.advanced_hwaccel,
+            values=["Без прискорення", "NVIDIA NVENC", "Intel Quick Sync", "AMD AMF"],
+            state="readonly",
+        ).grid(row=1, column=1, sticky="ew", pady=6)
+        ttk.Label(body, text="Власні параметри FFmpeg").grid(row=2, column=0, sticky="w", padx=(0, 10), pady=6)
+        ttk.Entry(body, textvariable=self.advanced_custom_args).grid(row=2, column=1, sticky="ew", pady=6)
+        ttk.Button(body, text="Зберегти", style="Accent.TButton", command=lambda: self._save_advanced_dialog(dialog)).grid(
+            row=3, column=1, sticky="e", pady=(10, 0)
+        )
+        dialog.grab_set()
+
+    def _save_advanced_dialog(self, dialog: tk.Toplevel) -> None:
+        self.settings["advanced_codec"] = self.advanced_codec.get()
+        self.settings["advanced_hwaccel"] = self.advanced_hwaccel.get()
+        self.settings["advanced_custom_args"] = self.advanced_custom_args.get()
         self._save_settings()
         dialog.destroy()
 
@@ -403,15 +516,18 @@ class PyFFmpegStudioApp(BaseTk):
         self.tab_video = ttk.Frame(self.main_tabs, padding=12)
         self.tab_audio = ttk.Frame(self.main_tabs, padding=12)
         self.tab_photo = ttk.Frame(self.main_tabs, padding=12)
+        self.tab_queue = ttk.Frame(self.main_tabs, padding=12)
         self.tab_manual = ttk.Frame(self.main_tabs, padding=12)
         self.main_tabs.add(self.tab_video, text=self._tr("Відео"))
         self.main_tabs.add(self.tab_audio, text=self._tr("Аудіо"))
         self.main_tabs.add(self.tab_photo, text=self._tr("Фото"))
+        self.main_tabs.add(self.tab_queue, text="Черга / Історія")
         self.main_tabs.add(self.tab_manual, text=self._tr("Ручна команда"))
 
         self._build_video_tabs()
         self._build_audio_tabs()
         self._build_photo_tabs()
+        self._build_queue_tab()
         self._build_manual_tab()
 
     def _build_video_tabs(self) -> None:
@@ -423,15 +539,30 @@ class PyFFmpegStudioApp(BaseTk):
         convert = ttk.Frame(self.video_subtabs, padding=18)
         trim = ttk.Frame(self.video_subtabs, padding=18)
         audio = ttk.Frame(self.video_subtabs, padding=18)
+        batch = ttk.Frame(self.video_subtabs, padding=18)
+        effects = ttk.Frame(self.video_subtabs, padding=18)
+        mark = ttk.Frame(self.video_subtabs, padding=18)
+        extract = ttk.Frame(self.video_subtabs, padding=18)
+        extra = ttk.Frame(self.video_subtabs, padding=18)
         self.video_subtabs.add(convert, text=self._tr("Конвертація та стиснення"))
         self.video_subtabs.add(trim, text=self._tr("Обрізання та Склеювання"))
         self.video_subtabs.add(audio, text=self._tr("Аудіодоріжка відео"))
+        self.video_subtabs.add(batch, text="Пакетна обробка")
+        self.video_subtabs.add(effects, text="Ефекти")
+        self.video_subtabs.add(mark, text="Водяний знак / субтитри")
+        self.video_subtabs.add(extract, text="Кадри / GIF / thumbnail")
+        self.video_subtabs.add(extra, text="YouTube / таймлапс / розмір")
 
         self.video_format = tk.StringVar(value="MP4")
         self.video_codec = tk.StringVar(value="libx264")
         self.video_crf = tk.DoubleVar(value=23)
         self.video_crf_label = tk.StringVar(value="23")
         self.video_resolution = tk.StringVar(value=self._tr("Оригінал"))
+        self.video_fps = tk.StringVar(value="Оригінал")
+        self.video_rotate = tk.StringVar(value="Без повороту")
+        self.video_speed = tk.DoubleVar(value=1.0)
+        self.video_speed_label = tk.StringVar(value="1.00x")
+        self.video_normalize = tk.BooleanVar(value=False)
 
         self._add_combo(convert, 0, self._tr("Формат"), self.video_format, ["MP4", "MKV", "MOV", "WebM"])
         self._add_combo(convert, 1, self._tr("Відеокодек"), self.video_codec, ["libx264", "libx265", "AV1"])
@@ -451,6 +582,21 @@ class PyFFmpegStudioApp(BaseTk):
             self._tr("Роздільна здатність"),
             self.video_resolution,
             [self._tr("Оригінал"), "1920x1080 (1080p)", "1280x720 (720p)", "640x480 (480p)"],
+        )
+        self._add_combo(convert, 4, "FPS", self.video_fps, ["Оригінал", "24", "25", "30", "50", "60"])
+        self._add_combo(convert, 5, "Поворот", self.video_rotate, ["Без повороту", "90° вправо", "90° вліво", "180°"])
+        self._add_scale(
+            convert,
+            6,
+            "Швидкість",
+            self.video_speed,
+            0.25,
+            4,
+            self.video_speed_label,
+            lambda value: f"{float(value):.2f}x",
+        )
+        ttk.Checkbutton(convert, text="Нормалізація гучності аудіо", variable=self.video_normalize).grid(
+            row=7, column=0, columnspan=2, sticky="w", pady=(8, 0)
         )
 
         self.trim_start = tk.StringVar()
@@ -493,6 +639,84 @@ class PyFFmpegStudioApp(BaseTk):
         ttk.Button(audio, text=self._tr("Скинути аудіо"), command=self.clear_replacement_audio).grid(row=2, column=0, sticky="w", pady=(10, 0))
         audio.columnconfigure(1, weight=1)
 
+        self.batch_format = tk.StringVar(value="MP4")
+        self.batch_codec = tk.StringVar(value="H.264")
+        self.batch_crf = tk.DoubleVar(value=23)
+        self.batch_crf_label = tk.StringVar(value="23")
+        self._add_combo(batch, 0, "Формат", self.batch_format, ["MP4", "MKV", "MOV", "WebM"])
+        self._add_combo(batch, 1, "Кодек", self.batch_codec, ["H.264", "H.265", "AV1", "VP9"])
+        self._add_scale(batch, 2, "CRF", self.batch_crf, 0, 51, self.batch_crf_label, lambda value: str(int(round(float(value)))))
+        batch_buttons = ttk.Frame(batch)
+        batch_buttons.grid(row=3, column=0, columnspan=2, sticky="ew", pady=(12, 8))
+        ttk.Button(batch_buttons, text="Додати відео", command=self.add_batch_files).pack(side="left")
+        ttk.Button(batch_buttons, text="Очистити", command=self.clear_batch_files).pack(side="left", padx=(8, 0))
+        self.batch_text = self._make_text(batch, height=8)
+        self.batch_text.grid(row=4, column=0, columnspan=2, sticky="nsew")
+        batch.rowconfigure(4, weight=1)
+        batch.columnconfigure(1, weight=1)
+
+        self.effects_rotate = tk.StringVar(value="Без повороту")
+        self.effects_speed = tk.DoubleVar(value=1.0)
+        self.effects_speed_label = tk.StringVar(value="1.00x")
+        self.effects_fps = tk.StringVar(value="Оригінал")
+        self.effects_normalize = tk.BooleanVar(value=False)
+        self.effects_codec = tk.StringVar(value="H.264")
+        self._add_combo(effects, 0, "Поворот", self.effects_rotate, ["Без повороту", "90° вправо", "90° вліво", "180°"])
+        self._add_scale(effects, 1, "Швидкість", self.effects_speed, 0.25, 8, self.effects_speed_label, lambda value: f"{float(value):.2f}x")
+        self._add_combo(effects, 2, "FPS", self.effects_fps, ["Оригінал", "12", "15", "24", "25", "30", "50", "60"])
+        self._add_combo(effects, 3, "Кодек", self.effects_codec, ["H.264", "H.265", "AV1", "VP9"])
+        ttk.Checkbutton(effects, text="Нормалізація гучності аудіо", variable=self.effects_normalize).grid(
+            row=4, column=0, columnspan=2, sticky="w", pady=(8, 0)
+        )
+
+        self.watermark_mode = tk.StringVar(value="Текст")
+        self.watermark_text = tk.StringVar()
+        self.watermark_image = tk.StringVar()
+        self.subtitle_file = tk.StringVar()
+        self._add_combo(mark, 0, "Тип водяного знака", self.watermark_mode, ["Текст", "Зображення"])
+        self._add_entry(mark, 1, "Текст", self.watermark_text, "PyFFmpeg-Studio")
+        ttk.Button(mark, text="Обрати зображення", command=self.choose_watermark_image).grid(row=2, column=0, sticky="w", pady=6)
+        ttk.Label(mark, textvariable=self.watermark_image).grid(row=2, column=1, sticky="ew", pady=6)
+        ttk.Button(mark, text="Обрати субтитри", command=self.choose_subtitle_file).grid(row=3, column=0, sticky="w", pady=6)
+        ttk.Label(mark, textvariable=self.subtitle_file).grid(row=3, column=1, sticky="ew", pady=6)
+        mark.columnconfigure(1, weight=1)
+
+        self.video_extract_operation = tk.StringVar(value="Витягнути кадри")
+        self.video_extract_fps = tk.StringVar(value="1")
+        self.video_extract_format = tk.StringVar(value="PNG")
+        self.video_extract_dir = tk.StringVar()
+        self.video_gif_start = tk.StringVar()
+        self.video_gif_end = tk.StringVar()
+        self.video_gif_fps = tk.StringVar(value="15")
+        self.video_gif_width = tk.DoubleVar(value=480)
+        self.video_gif_width_label = tk.StringVar(value="480 px")
+        self.thumbnail_time = tk.StringVar(value="1")
+        self._add_combo(extract, 0, "Операція", self.video_extract_operation, ["Витягнути кадри", "Створити GIF", "Мініатюра"])
+        self._add_entry(extract, 1, "Кадрів/сек або час thumbnail", self.video_extract_fps, "1")
+        self._add_combo(extract, 2, "Формат кадрів", self.video_extract_format, ["PNG", "JPG"])
+        self._add_entry(extract, 3, "GIF старт", self.video_gif_start, "0")
+        self._add_entry(extract, 4, "GIF фініш", self.video_gif_end, "5")
+        self._add_combo(extract, 5, "GIF FPS", self.video_gif_fps, ["10", "15", "24", "30"])
+        self._add_scale(extract, 6, "GIF ширина", self.video_gif_width, 160, 1080, self.video_gif_width_label, lambda value: f"{int(round(float(value)))} px")
+        ttk.Button(extract, text="Папка результату", command=lambda: self.choose_directory_var(self.video_extract_dir)).grid(row=7, column=0, sticky="w", pady=6)
+        ttk.Label(extract, textvariable=self.video_extract_dir).grid(row=7, column=1, sticky="ew", pady=6)
+        extract.columnconfigure(1, weight=1)
+
+        self.extra_operation = tk.StringVar(value="Таймлапс")
+        self.youtube_url = tk.StringVar()
+        self.extra_output_dir = tk.StringVar()
+        self.timelapse_speed = tk.StringVar(value="8")
+        self.target_size_mb = tk.StringVar(value="25")
+        self.extra_codec = tk.StringVar(value="H.264")
+        self._add_combo(extra, 0, "Операція", self.extra_operation, ["Таймлапс", "Автостискання", "Завантажити YouTube"])
+        self._add_entry(extra, 1, "YouTube URL", self.youtube_url, "https://youtube.com/...")
+        self._add_entry(extra, 2, "Швидкість таймлапсу", self.timelapse_speed, "8")
+        self._add_entry(extra, 3, "Цільовий розмір MB", self.target_size_mb, "25")
+        self._add_combo(extra, 4, "Кодек", self.extra_codec, ["H.264", "H.265", "AV1", "VP9"])
+        ttk.Button(extra, text="Папка результату", command=lambda: self.choose_directory_var(self.extra_output_dir)).grid(row=5, column=0, sticky="w", pady=6)
+        ttk.Label(extra, textvariable=self.extra_output_dir).grid(row=5, column=1, sticky="ew", pady=6)
+        extra.columnconfigure(1, weight=1)
+
     def _build_audio_tabs(self) -> None:
         self.tab_audio.columnconfigure(0, weight=1)
         self.tab_audio.rowconfigure(0, weight=1)
@@ -501,8 +725,10 @@ class PyFFmpegStudioApp(BaseTk):
 
         convert = ttk.Frame(self.audio_subtabs, padding=18)
         process = ttk.Frame(self.audio_subtabs, padding=18)
+        merge = ttk.Frame(self.audio_subtabs, padding=18)
         self.audio_subtabs.add(convert, text=self._tr("Зміна формату"))
         self.audio_subtabs.add(process, text=self._tr("Обробка звуку"))
+        self.audio_subtabs.add(merge, text="Об'єднання / витягування")
 
         self.audio_format = tk.StringVar(value="MP3")
         self.audio_bitrate = tk.StringVar(value="192 kbps")
@@ -534,6 +760,21 @@ class PyFFmpegStudioApp(BaseTk):
         ttk.Checkbutton(process, text=self._tr("Плавного кінця (Fade-out)"), variable=self.fade_out).grid(
             row=4, column=0, columnspan=2, sticky="w", pady=(8, 0)
         )
+
+        self.audio_merge_operation = tk.StringVar(value="Об'єднати аудіо")
+        self.audio_merge_format = tk.StringVar(value="MP3")
+        self.audio_merge_bitrate = tk.StringVar(value="192 kbps")
+        self._add_combo(merge, 0, "Операція", self.audio_merge_operation, ["Об'єднати аудіо", "Витягнути аудіо з відео"])
+        self._add_combo(merge, 1, "Формат", self.audio_merge_format, ["MP3", "WAV", "FLAC", "AAC", "OGG"])
+        self._add_combo(merge, 2, "Бітрейт MP3", self.audio_merge_bitrate, ["128 kbps", "192 kbps", "320 kbps"])
+        audio_merge_buttons = ttk.Frame(merge)
+        audio_merge_buttons.grid(row=3, column=0, columnspan=2, sticky="ew", pady=(12, 8))
+        ttk.Button(audio_merge_buttons, text="Додати аудіо", command=self.add_audio_merge_files).pack(side="left")
+        ttk.Button(audio_merge_buttons, text="Очистити", command=self.clear_audio_merge_files).pack(side="left", padx=(8, 0))
+        self.audio_merge_text = self._make_text(merge, height=8)
+        self.audio_merge_text.grid(row=4, column=0, columnspan=2, sticky="nsew")
+        merge.rowconfigure(4, weight=1)
+        merge.columnconfigure(1, weight=1)
 
     def _build_photo_tabs(self) -> None:
         self.tab_photo.columnconfigure(0, weight=1)
@@ -580,6 +821,39 @@ class PyFFmpegStudioApp(BaseTk):
         ttk.Button(frames, text=self._tr("Обрати папку"), command=self.choose_frames_directory).grid(row=1, column=0, sticky="w", pady=(8, 0))
         ttk.Label(frames, textvariable=self.frames_dir).grid(row=1, column=1, sticky="ew", padx=(10, 0), pady=(8, 0))
         frames.columnconfigure(1, weight=1)
+
+    def _build_queue_tab(self) -> None:
+        self.tab_queue.columnconfigure((0, 1), weight=1)
+        self.tab_queue.rowconfigure(1, weight=1)
+        self.tab_queue.rowconfigure(4, weight=1)
+
+        ttk.Label(self.tab_queue, text="Черга завдань").grid(row=0, column=0, sticky="w", pady=(0, 6))
+        ttk.Label(self.tab_queue, text="Історія операцій").grid(row=0, column=1, sticky="w", padx=(12, 0), pady=(0, 6))
+        self.queue_text = self._make_text(self.tab_queue, height=8)
+        self.history_text = self._make_text(self.tab_queue, height=8)
+        self.queue_text.grid(row=1, column=0, sticky="nsew", padx=(0, 6))
+        self.history_text.grid(row=1, column=1, sticky="nsew", padx=(6, 0))
+
+        queue_buttons = ttk.Frame(self.tab_queue)
+        queue_buttons.grid(row=2, column=0, columnspan=2, sticky="ew", pady=10)
+        ttk.Button(queue_buttons, text="Додати поточне завдання в чергу", command=self.add_current_job_to_queue).pack(side="left")
+        ttk.Button(queue_buttons, text="Запустити чергу", command=self.run_task_queue).pack(side="left", padx=(8, 0))
+        ttk.Button(queue_buttons, text="Очистити чергу", command=self.clear_task_queue).pack(side="left", padx=(8, 0))
+        ttk.Button(queue_buttons, text="Очистити історію", command=self.clear_history).pack(side="left", padx=(8, 0))
+
+        ttk.Label(self.tab_queue, text="Профілі налаштувань").grid(row=3, column=0, columnspan=2, sticky="w", pady=(4, 6))
+        profile_row = ttk.Frame(self.tab_queue)
+        profile_row.grid(row=4, column=0, columnspan=2, sticky="new")
+        profile_row.columnconfigure(1, weight=1)
+        self.profile_name = tk.StringVar()
+        self.profile_choice = tk.StringVar()
+        ttk.Entry(profile_row, textvariable=self.profile_name).grid(row=0, column=0, sticky="ew", padx=(0, 8))
+        self.profile_combo = ttk.Combobox(profile_row, textvariable=self.profile_choice, values=list(self.profiles.keys()), state="readonly")
+        self.profile_combo.grid(row=0, column=1, sticky="ew", padx=(0, 8))
+        ttk.Button(profile_row, text="Зберегти профіль", command=self.save_profile).grid(row=0, column=2, padx=(0, 8))
+        ttk.Button(profile_row, text="Завантажити профіль", command=self.load_profile).grid(row=0, column=3)
+        self._refresh_queue_text()
+        self._refresh_history_text()
 
     def _build_manual_tab(self) -> None:
         self.tab_manual.columnconfigure(0, weight=1)
@@ -637,8 +911,11 @@ class PyFFmpegStudioApp(BaseTk):
 
         self.progress_bar = ttk.Progressbar(panel, variable=self.progress_value, maximum=100)
         self.progress_bar.grid(row=0, column=0, sticky="ew", padx=(0, 12))
-        self.run_button = ttk.Button(panel, text=self._tr("ЗАПУСТИТИ ОБРОБКУ"), style="Run.TButton", command=self.run_processing)
-        self.run_button.grid(row=0, column=1, sticky="e")
+        bottom_actions = ttk.Frame(panel, style="Panel.TFrame")
+        bottom_actions.grid(row=0, column=1, sticky="e")
+        ttk.Button(bottom_actions, text="Лог FFmpeg", command=self.open_log_window).pack(side="left", padx=(0, 8))
+        self.run_button = ttk.Button(bottom_actions, text=self._tr("ЗАПУСТИТИ ОБРОБКУ"), style="Run.TButton", command=self.run_processing)
+        self.run_button.pack(side="left")
         ttk.Label(panel, textvariable=self.status_text, style="Panel.TLabel").grid(row=1, column=0, columnspan=2, sticky="w", pady=(8, 0))
 
     def _add_combo(
@@ -695,6 +972,20 @@ class PyFFmpegStudioApp(BaseTk):
         parent.columnconfigure(1, weight=1)
         return scale
 
+    def _make_text(self, parent: ttk.Frame, height: int = 8) -> tk.Text:
+        return tk.Text(
+            parent,
+            height=height,
+            wrap="none",
+            state="disabled",
+            font=("Consolas", 9),
+            bg="#0f172a" if self.theme_name.get() == "Темна" else "#f8fafc",
+            fg="#e5e7eb" if self.theme_name.get() == "Темна" else "#0f172a",
+            relief="flat",
+            padx=10,
+            pady=8,
+        )
+
     def choose_input_file(self) -> None:
         path = filedialog.askopenfilename(
             title=self._tr("Оберіть медіафайл"),
@@ -718,6 +1009,32 @@ class PyFFmpegStudioApp(BaseTk):
         self.drop_hint.set(self._tr("Активний файл: {name}", name=media_info.name))
         self.status_text.set(self._tr("Файл завантажено"))
 
+    def preview_input_file(self) -> None:
+        path = self.input_path.get().strip()
+        if not path:
+            messagebox.showerror(self._tr("Помилка"), self._tr("Спочатку оберіть вхідний файл."))
+            return
+        if shutil.which("ffplay"):
+            subprocess.Popen(["ffplay", "-autoexit", path], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            return
+        try:
+            subprocess.Popen(["cmd.exe", "/c", "start", "", path], shell=False)
+        except OSError as exc:
+            messagebox.showerror(self._tr("Помилка"), str(exc))
+
+    def show_file_info(self) -> None:
+        path = self.input_path.get().strip()
+        if not path:
+            messagebox.showerror(self._tr("Помилка"), self._tr("Спочатку оберіть вхідний файл."))
+            return
+        dialog = tk.Toplevel(self)
+        dialog.title("Інформація про файл")
+        dialog.geometry("560x360")
+        text = tk.Text(dialog, wrap="word", font=("Consolas", 10), padx=10, pady=10)
+        text.pack(fill="both", expand=True)
+        text.insert("1.0", probe_media_details(path))
+        text.configure(state="disabled")
+
     def add_concat_files(self) -> None:
         paths = filedialog.askopenfilenames(
             title=self._tr("Додати відеофайли"),
@@ -727,6 +1044,50 @@ class PyFFmpegStudioApp(BaseTk):
             return
         self.concat_files.extend(Path(path) for path in paths)
         self._refresh_concat_text()
+
+    def add_batch_files(self) -> None:
+        paths = filedialog.askopenfilenames(
+            title="Додати файли для пакетної обробки",
+            filetypes=[(self._tr("Відеофайли"), _file_pattern(VIDEO_EXTENSIONS)), (self._tr("Усі файли"), "*.*")],
+        )
+        if paths:
+            self.batch_files.extend(Path(path) for path in paths)
+            self._refresh_batch_text()
+
+    def clear_batch_files(self) -> None:
+        self.batch_files.clear()
+        self._refresh_batch_text()
+
+    def add_audio_merge_files(self) -> None:
+        paths = filedialog.askopenfilenames(
+            title="Додати аудіофайли",
+            filetypes=[(self._tr("Аудіофайли"), _file_pattern(AUDIO_EXTENSIONS)), (self._tr("Усі файли"), "*.*")],
+        )
+        if paths:
+            self.audio_merge_files.extend(Path(path) for path in paths)
+            self._refresh_audio_merge_text()
+
+    def clear_audio_merge_files(self) -> None:
+        self.audio_merge_files.clear()
+        self._refresh_audio_merge_text()
+
+    def choose_directory_var(self, variable: tk.StringVar) -> None:
+        path = filedialog.askdirectory(title=self._tr("Обрати папку"))
+        if path:
+            variable.set(path)
+
+    def choose_watermark_image(self) -> None:
+        path = filedialog.askopenfilename(
+            title="Обрати зображення водяного знака",
+            filetypes=[("Зображення", _file_pattern(IMAGE_EXTENSIONS)), (self._tr("Усі файли"), "*.*")],
+        )
+        if path:
+            self.watermark_image.set(path)
+
+    def choose_subtitle_file(self) -> None:
+        path = filedialog.askopenfilename(title="Обрати субтитри", filetypes=[("Subtitles", "*.srt *.ass *.vtt"), (self._tr("Усі файли"), "*.*")])
+        if path:
+            self.subtitle_file.set(path)
 
     def clear_concat_files(self) -> None:
         self.concat_files.clear()
@@ -777,25 +1138,57 @@ class PyFFmpegStudioApp(BaseTk):
         if self._active_main_tab_key() == "manual":
             self.run_manual_command()
             return
-        if not self.input_path.get():
+        if self._active_main_tab_key() == "queue":
+            self.run_task_queue()
+            return
+        if not self.input_path.get() and not self._is_youtube_operation():
             messagebox.showerror(self._tr("Помилка"), self._tr("Спочатку оберіть вхідний файл."))
             return
 
         try:
-            job = build_command_job(
-                input_path=self.input_path.get(),
+            jobs = self._build_current_jobs()
+        except CommandBuildError as exc:
+            messagebox.showerror(self._tr("Помилка налаштувань"), str(exc))
+            return
+        if len(jobs) > 1:
+            self.task_queue.extend(jobs)
+            self._refresh_queue_text()
+            self.run_task_queue()
+            return
+
+        self._set_processing_state(True, jobs[0])
+        worker = threading.Thread(target=self._run_worker, args=(jobs[0],), daemon=True)
+        worker.start()
+
+    def _is_youtube_operation(self) -> bool:
+        return self._active_main_tab_key() == "video" and self.video_subtabs.index(self.video_subtabs.select()) == 7 and self.extra_operation.get() == "Завантажити YouTube"
+
+    def _build_current_jobs(self) -> list[CommandJob]:
+        if self._active_main_tab_key() == "video" and self.video_subtabs.index(self.video_subtabs.select()) == 3:
+            if not self.batch_files:
+                raise CommandBuildError("Додайте файли для пакетної обробки.")
+            jobs: list[CommandJob] = []
+            for path in self.batch_files:
+                job = build_command_job(
+                    input_path=path,
+                    main_tab="Відео",
+                    sub_tab="Пакетна обробка",
+                    settings=self._collect_settings(),
+                    duration=None,
+                )
+                jobs.append(job)
+            return jobs
+
+        input_path = self.input_path.get() or str(APP_DIR)
+        return [
+            build_command_job(
+                input_path=input_path,
                 main_tab=self._active_backend_main_tab(),
                 sub_tab=self._active_backend_subtab(),
                 settings=self._collect_settings(),
                 duration=self.media_duration,
             )
-        except CommandBuildError as exc:
-            messagebox.showerror(self._tr("Помилка налаштувань"), str(exc))
-            return
-
-        self._set_processing_state(True, job)
-        worker = threading.Thread(target=self._run_worker, args=(job,), daemon=True)
-        worker.start()
+        ]
 
     def run_manual_command(self) -> None:
         command_text = self.manual_command_text.get("1.0", "end").strip()
@@ -815,10 +1208,12 @@ class PyFFmpegStudioApp(BaseTk):
         worker.start()
 
     def _run_worker(self, job: CommandJob) -> None:
+        self.last_ffmpeg_log = ""
         result = run_ffmpeg(
             job,
             progress_callback=lambda value: self.after(0, self._set_progress, value),
             status_callback=lambda text: self.after(0, self.status_text.set, self._tr(text)),
+            output_callback=lambda text: self.after(0, self._append_ffmpeg_log, text),
         )
         self.after(0, self._finish_processing, result)
 
@@ -836,6 +1231,7 @@ class PyFFmpegStudioApp(BaseTk):
 
     def _finish_processing(self, result: FfmpegResult) -> None:
         self._set_processing_state(False, None)
+        self._add_history(result)
         if result.success:
             output = str(result.output_path) if result.output_path else self._tr("Готово")
             self.status_text.set(f"{self._tr('Готово')}: {output}")
@@ -849,8 +1245,43 @@ class PyFFmpegStudioApp(BaseTk):
             self._tr("Код завершення: {code}{log}\n\n{error}", code=result.returncode, log=log_info, error=result.error_text[-1200:]),
         )
 
+    def run_task_queue(self) -> None:
+        if self.processing:
+            return
+        if not self.task_queue:
+            messagebox.showinfo("Черга", "Черга порожня.")
+            return
+        job = self.task_queue.pop(0)
+        self._refresh_queue_text()
+        self._set_processing_state(True, job)
+        worker = threading.Thread(target=self._run_queue_worker, args=(job,), daemon=True)
+        worker.start()
+
+    def _run_queue_worker(self, job: CommandJob) -> None:
+        self.last_ffmpeg_log = ""
+        result = run_ffmpeg(
+            job,
+            progress_callback=lambda value: self.after(0, self._set_progress, value),
+            status_callback=lambda text: self.after(0, self.status_text.set, self._tr(text)),
+            output_callback=lambda text: self.after(0, self._append_ffmpeg_log, text),
+        )
+        self.after(0, self._finish_queue_job, result)
+
+    def _finish_queue_job(self, result: FfmpegResult) -> None:
+        self._set_processing_state(False, None)
+        self._add_history(result)
+        if self.task_queue:
+            self.after(250, self.run_task_queue)
+            return
+        if result.success:
+            self.status_text.set("Чергу виконано")
+            messagebox.showinfo("Черга", "Усі завдання черги виконано.")
+        else:
+            messagebox.showerror("Черга", f"Завдання завершилось з помилкою: {result.error_text[-800:]}")
+
     def _finish_manual_command(self, result: FfmpegResult) -> None:
         self._set_processing_state(False, None)
+        self._add_history(result)
         if result.success:
             self.progress_value.set(100)
             self.status_text.set(self._tr("CMD-команду виконано успішно."))
@@ -874,6 +1305,7 @@ class PyFFmpegStudioApp(BaseTk):
         self._set_interactive_widgets_state(active)
 
         if active:
+            self.processing_started_at = time.time()
             self.progress_value.set(0)
             if not job or not job.progress_duration:
                 self.progress_bar.configure(mode="indeterminate")
@@ -887,7 +1319,12 @@ class PyFFmpegStudioApp(BaseTk):
 
     def _set_progress(self, value: float) -> None:
         self.progress_value.set(value)
-        self.status_text.set(self._tr("Обробка: {progress:.0f}%", progress=value))
+        eta = ""
+        if value > 1 and self.processing_started_at:
+            elapsed = time.time() - self.processing_started_at
+            remaining = max(0, elapsed * (100 - value) / value)
+            eta = f" | ETA: {int(remaining // 60):02d}:{int(remaining % 60):02d}"
+        self.status_text.set(self._tr("Обробка: {progress:.0f}%", progress=value) + eta)
 
     def _append_manual_output(self, text: str) -> None:
         self.manual_output_text.configure(state="normal")
@@ -895,11 +1332,123 @@ class PyFFmpegStudioApp(BaseTk):
         self.manual_output_text.see("end")
         self.manual_output_text.configure(state="disabled")
 
+    def _append_ffmpeg_log(self, text: str) -> None:
+        self.last_ffmpeg_log += text
+
+    def open_log_window(self) -> None:
+        dialog = tk.Toplevel(self)
+        dialog.title("Лог FFmpeg")
+        dialog.geometry("860x480")
+        text = tk.Text(dialog, wrap="word", font=("Consolas", 9), padx=10, pady=10)
+        text.pack(fill="both", expand=True)
+        text.insert("1.0", self.last_ffmpeg_log or "Лог ще порожній.")
+
+    def _add_history(self, result: FfmpegResult) -> None:
+        self.history.append(
+            {
+                "time": time.strftime("%Y-%m-%d %H:%M:%S"),
+                "success": result.success,
+                "returncode": result.returncode,
+                "output": str(result.output_path) if result.output_path else "",
+                "command": " ".join(result.command),
+            }
+        )
+        self.history = self.history[-200:]
+        self._save_history()
+        if hasattr(self, "history_text"):
+            self._refresh_history_text()
+
+    def add_current_job_to_queue(self) -> None:
+        try:
+            jobs = self._build_current_jobs()
+        except CommandBuildError as exc:
+            messagebox.showerror(self._tr("Помилка налаштувань"), str(exc))
+            return
+        self.task_queue.extend(jobs)
+        self._refresh_queue_text()
+
+    def clear_task_queue(self) -> None:
+        self.task_queue.clear()
+        self._refresh_queue_text()
+
+    def clear_history(self) -> None:
+        self.history.clear()
+        self._save_history()
+        self._refresh_history_text()
+
+    def _refresh_queue_text(self) -> None:
+        if not hasattr(self, "queue_text"):
+            return
+        self.queue_text.configure(state="normal")
+        self.queue_text.delete("1.0", "end")
+        if not self.task_queue:
+            self.queue_text.insert("end", "Черга порожня.\n")
+        else:
+            for index, job in enumerate(self.task_queue, start=1):
+                label = job.title or (job.output_path.name if job.output_path else job.command[0])
+                self.queue_text.insert("end", f"{index}. {label}\n")
+        self.queue_text.configure(state="disabled")
+
+    def _refresh_history_text(self) -> None:
+        if not hasattr(self, "history_text"):
+            return
+        self.history_text.configure(state="normal")
+        self.history_text.delete("1.0", "end")
+        if not self.history:
+            self.history_text.insert("end", "Історія порожня.\n")
+        else:
+            for item in reversed(self.history[-100:]):
+                mark = "OK" if item.get("success") else "ERR"
+                self.history_text.insert("end", f"[{mark}] {item.get('time')} -> {item.get('output')}\n")
+        self.history_text.configure(state="disabled")
+
+    def save_profile(self) -> None:
+        name = self.profile_name.get().strip()
+        if not name:
+            messagebox.showerror(self._tr("Помилка"), "Введіть назву профілю.")
+            return
+        self.profiles[name] = self._collect_profile_settings()
+        self._save_profiles()
+        self.profile_combo.configure(values=list(self.profiles.keys()))
+        self.profile_choice.set(name)
+
+    def load_profile(self) -> None:
+        name = self.profile_choice.get().strip()
+        payload = self.profiles.get(name)
+        if not isinstance(payload, dict):
+            messagebox.showerror(self._tr("Помилка"), "Оберіть профіль.")
+            return
+        for attr, value in payload.items():
+            if hasattr(self, attr):
+                getattr(self, attr).set(value)
+
+    def _collect_profile_settings(self) -> dict[str, object]:
+        names = [
+            "video_format",
+            "video_codec",
+            "video_crf",
+            "video_resolution",
+            "video_fps",
+            "video_rotate",
+            "video_speed",
+            "video_normalize",
+            "audio_format",
+            "audio_bitrate",
+            "audio_volume",
+            "photo_format",
+            "advanced_codec",
+            "advanced_hwaccel",
+            "advanced_custom_args",
+        ]
+        return {name: getattr(self, name).get() for name in names if hasattr(self, name)}
+
     def _snapshot_ui_state(self) -> dict[str, object]:
         state: dict[str, object] = {
             "input_path": self.input_path.get(),
             "media_duration": self.media_duration,
             "concat_files": [str(path) for path in self.concat_files],
+            "batch_files": [str(path) for path in self.batch_files],
+            "audio_merge_files": [str(path) for path in self.audio_merge_files],
             "manual_workdir": self.manual_workdir.get(),
         }
 
@@ -908,10 +1457,40 @@ class PyFFmpegStudioApp(BaseTk):
             "video_codec",
             "video_crf",
             "video_resolution",
+            "video_fps",
+            "video_rotate",
+            "video_speed",
+            "video_normalize",
             "trim_start",
             "trim_end",
             "remove_audio",
             "replacement_audio",
+            "batch_format",
+            "batch_codec",
+            "batch_crf",
+            "effects_rotate",
+            "effects_speed",
+            "effects_fps",
+            "effects_normalize",
+            "effects_codec",
+            "watermark_mode",
+            "watermark_text",
+            "watermark_image",
+            "subtitle_file",
+            "video_extract_operation",
+            "video_extract_fps",
+            "video_extract_format",
+            "video_extract_dir",
+            "video_gif_start",
+            "video_gif_end",
+            "video_gif_fps",
+            "video_gif_width",
+            "extra_operation",
+            "youtube_url",
+            "extra_output_dir",
+            "timelapse_speed",
+            "target_size_mb",
+            "extra_codec",
             "audio_format",
             "audio_bitrate",
             "audio_start",
@@ -919,6 +1498,9 @@ class PyFFmpegStudioApp(BaseTk):
             "audio_volume",
             "fade_in",
             "fade_out",
+            "audio_merge_operation",
+            "audio_merge_format",
+            "audio_merge_bitrate",
             "photo_format",
             "gif_start",
             "gif_end",
@@ -965,10 +1547,40 @@ class PyFFmpegStudioApp(BaseTk):
             "video_codec",
             "video_crf",
             "video_resolution",
+            "video_fps",
+            "video_rotate",
+            "video_speed",
+            "video_normalize",
             "trim_start",
             "trim_end",
             "remove_audio",
             "replacement_audio",
+            "batch_format",
+            "batch_codec",
+            "batch_crf",
+            "effects_rotate",
+            "effects_speed",
+            "effects_fps",
+            "effects_normalize",
+            "effects_codec",
+            "watermark_mode",
+            "watermark_text",
+            "watermark_image",
+            "subtitle_file",
+            "video_extract_operation",
+            "video_extract_fps",
+            "video_extract_format",
+            "video_extract_dir",
+            "video_gif_start",
+            "video_gif_end",
+            "video_gif_fps",
+            "video_gif_width",
+            "extra_operation",
+            "youtube_url",
+            "extra_output_dir",
+            "timelapse_speed",
+            "target_size_mb",
+            "extra_codec",
             "audio_format",
             "audio_bitrate",
             "audio_start",
@@ -976,6 +1588,9 @@ class PyFFmpegStudioApp(BaseTk):
             "audio_volume",
             "fade_in",
             "fade_out",
+            "audio_merge_operation",
+            "audio_merge_format",
+            "audio_merge_bitrate",
             "photo_format",
             "gif_start",
             "gif_end",
@@ -991,11 +1606,23 @@ class PyFFmpegStudioApp(BaseTk):
                 getattr(self, attr).set(value)
 
         self.video_crf_label.set(str(int(round(float(self.video_crf.get())))))
+        if hasattr(self, "batch_crf_label"):
+            self.batch_crf_label.set(str(int(round(float(self.batch_crf.get())))))
+        if hasattr(self, "video_speed_label"):
+            self.video_speed_label.set(f"{float(self.video_speed.get()):.2f}x")
+        if hasattr(self, "effects_speed_label"):
+            self.effects_speed_label.set(f"{float(self.effects_speed.get()):.2f}x")
         self.audio_volume_label.set(f"{int(round(float(self.audio_volume.get())))}%")
         self.gif_width_label.set(f"{int(round(float(self.gif_width.get())))} px")
+        if hasattr(self, "video_gif_width_label"):
+            self.video_gif_width_label.set(f"{int(round(float(self.video_gif_width.get())))} px")
 
         self.concat_files = [Path(path) for path in state.get("concat_files", [])]
+        self.batch_files = [Path(path) for path in state.get("batch_files", [])]
+        self.audio_merge_files = [Path(path) for path in state.get("audio_merge_files", [])]
         self._refresh_concat_text()
+        self._refresh_batch_text()
+        self._refresh_audio_merge_text()
 
         self.manual_command_text.delete("1.0", "end")
         self.manual_command_text.insert("1.0", str(state.get("manual_command") or ""))
@@ -1041,11 +1668,17 @@ class PyFFmpegStudioApp(BaseTk):
             resolution = self.video_resolution.get()
             if resolution in {"Оригінал", "Original"}:
                 resolution = "Оригінал"
+            codec = self.advanced_codec.get() if self.advanced_enabled.get() and self.advanced_codec.get() != "Авто" else self.video_codec.get()
             return {
                 "format": self.video_format.get(),
-                "codec": self.video_codec.get(),
+                "codec": codec,
                 "crf": int(round(self.video_crf.get())),
                 "resolution": resolution,
+                "fps": self.video_fps.get(),
+                "rotate": self.video_rotate.get(),
+                "speed": self.video_speed.get(),
+                "normalize_audio": self.video_normalize.get(),
+                **self._advanced_settings(),
             }
         if sub_tab == 1:
             return {
@@ -1053,9 +1686,56 @@ class PyFFmpegStudioApp(BaseTk):
                 "trim_end": self.trim_end.get(),
                 "concat_files": [str(path) for path in self.concat_files],
             }
-        return {
+        if sub_tab == 2:
+            return {
             "remove_audio": self.remove_audio.get(),
             "replacement_audio": self.replacement_audio.get(),
+            }
+        if sub_tab == 3:
+            return {
+                "batch_files": [str(path) for path in self.batch_files],
+                "format": self.batch_format.get(),
+                "codec": self.advanced_codec.get() if self.advanced_enabled.get() and self.advanced_codec.get() != "Авто" else self.batch_codec.get(),
+                "crf": int(round(self.batch_crf.get())),
+                **self._advanced_settings(),
+            }
+        if sub_tab == 4:
+            return {
+                "rotate": self.effects_rotate.get(),
+                "speed": self.effects_speed.get(),
+                "fps": self.effects_fps.get(),
+                "normalize_audio": self.effects_normalize.get(),
+                "codec": self.advanced_codec.get() if self.advanced_enabled.get() and self.advanced_codec.get() != "Авто" else self.effects_codec.get(),
+                **self._advanced_settings(),
+            }
+        if sub_tab == 5:
+            return {
+                "watermark_mode": self.watermark_mode.get(),
+                "watermark_text": self.watermark_text.get(),
+                "watermark_image": self.watermark_image.get(),
+                "subtitles": self.subtitle_file.get(),
+                **self._advanced_settings(),
+            }
+        if sub_tab == 6:
+            return {
+                "operation": self.video_extract_operation.get(),
+                "frames_fps": self.video_extract_fps.get(),
+                "image_format": self.video_extract_format.get(),
+                "output_dir": self.video_extract_dir.get(),
+                "gif_start": self.video_gif_start.get(),
+                "gif_end": self.video_gif_end.get(),
+                "gif_fps": self.video_gif_fps.get(),
+                "gif_width": int(round(self.video_gif_width.get())),
+                "thumbnail_time": self.video_extract_fps.get(),
+            }
+        return {
+            "operation": self.extra_operation.get(),
+            "youtube_url": self.youtube_url.get(),
+            "output_dir": self.extra_output_dir.get(),
+            "timelapse_speed": self.timelapse_speed.get(),
+            "target_mb": self.target_size_mb.get(),
+            "codec": self.advanced_codec.get() if self.advanced_enabled.get() and self.advanced_codec.get() != "Авто" else self.extra_codec.get(),
+            **self._advanced_settings(),
         }
 
     def _collect_audio_settings(self) -> dict[str, object]:
@@ -1065,12 +1745,19 @@ class PyFFmpegStudioApp(BaseTk):
                 "format": self.audio_format.get(),
                 "bitrate": self.audio_bitrate.get(),
             }
-        return {
+        if sub_tab == 1:
+            return {
             "audio_start": self.audio_start.get(),
             "audio_end": self.audio_end.get(),
             "volume": int(round(self.audio_volume.get())),
             "fade_in": self.fade_in.get(),
             "fade_out": self.fade_out.get(),
+            }
+        return {
+            "operation": self.audio_merge_operation.get(),
+            "format": self.audio_merge_format.get(),
+            "bitrate": self.audio_merge_bitrate.get(),
+            "audio_files": [str(path) for path in self.audio_merge_files],
         }
 
     def _collect_photo_settings(self) -> dict[str, object]:
@@ -1089,8 +1776,16 @@ class PyFFmpegStudioApp(BaseTk):
             "frames_dir": self.frames_dir.get(),
         }
 
+    def _advanced_settings(self) -> dict[str, object]:
+        if not self.advanced_enabled.get():
+            return {}
+        return {
+            "hwaccel": self.advanced_hwaccel.get(),
+            "custom_args": self.advanced_custom_args.get(),
+        }
+
     def _active_main_tab_key(self) -> str:
-        keys = ["video", "audio", "photo", "manual"]
+        keys = ["video", "audio", "photo", "queue", "manual"]
         return keys[self.main_tabs.index(self.main_tabs.select())]
 
     def _active_backend_main_tab(self) -> str:
@@ -1099,11 +1794,20 @@ class PyFFmpegStudioApp(BaseTk):
     def _active_backend_subtab(self) -> str:
         main_tab = self._active_main_tab_key()
         if main_tab == "video":
-            return ["Конвертація та стиснення", "Обрізання та Склеювання", "Аудіодоріжка відео"][
+            return [
+                "Конвертація та стиснення",
+                "Обрізання та Склеювання",
+                "Аудіодоріжка відео",
+                "Пакетна обробка",
+                "Відео ефекти",
+                "Водяний знак і субтитри",
+                "Кадри GIF мініатюра",
+                "YouTube таймлапс стискання",
+            ][
                 self.video_subtabs.index(self.video_subtabs.select())
             ]
         if main_tab == "audio":
-            return ["Зміна формату", "Обробка звуку"][self.audio_subtabs.index(self.audio_subtabs.select())]
+            return ["Зміна формату", "Обробка звуку", "Об'єднання та витягування"][self.audio_subtabs.index(self.audio_subtabs.select())]
         return ["Конвертація зображень", "Створення GIF", "Розкадровка"][self.photo_subtabs.index(self.photo_subtabs.select())]
 
     def _set_notebook_state(self, notebook: ttk.Notebook, state: str) -> None:
@@ -1150,6 +1854,30 @@ class PyFFmpegStudioApp(BaseTk):
         else:
             self.concat_text.insert("end", self._tr("Список порожній. Додайте файли для безшовного склеювання.\n"))
         self.concat_text.configure(state="disabled")
+
+    def _refresh_batch_text(self) -> None:
+        if not hasattr(self, "batch_text"):
+            return
+        self.batch_text.configure(state="normal")
+        self.batch_text.delete("1.0", "end")
+        if self.batch_files:
+            for index, path in enumerate(self.batch_files, start=1):
+                self.batch_text.insert("end", f"{index}. {path}\n")
+        else:
+            self.batch_text.insert("end", "Список пакетної обробки порожній.\n")
+        self.batch_text.configure(state="disabled")
+
+    def _refresh_audio_merge_text(self) -> None:
+        if not hasattr(self, "audio_merge_text"):
+            return
+        self.audio_merge_text.configure(state="normal")
+        self.audio_merge_text.delete("1.0", "end")
+        if self.audio_merge_files:
+            for index, path in enumerate(self.audio_merge_files, start=1):
+                self.audio_merge_text.insert("end", f"{index}. {path}\n")
+        else:
+            self.audio_merge_text.insert("end", "Список аудіофайлів порожній.\n")
+        self.audio_merge_text.configure(state="disabled")
 
     def _sync_audio_controls(self) -> None:
         if self.remove_audio.get():

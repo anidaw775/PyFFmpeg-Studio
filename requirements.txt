@@ -1,1 +1,2 @@
 tkinterdnd2>=0.4.2
+yt-dlp>=2025.1.15
